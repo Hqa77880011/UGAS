@@ -35,6 +35,7 @@ class Critic(nn.Module):
 
 
 class Learner:
+    algorithm = "ugas"
     def __init__(self, critics, device, conservative=1, entropy=0.1, constraint_penalty=0):
         self.device, self.conservative, self.entropy = device, conservative, entropy
         self.constraint_penalty = constraint_penalty
@@ -87,35 +88,42 @@ class Learner:
 
     def save(self, path, q95=1, interactions=0):
         torch.save({"actor": self.actor.state_dict(), "critics": self.critics.state_dict(), "targets": self.targets.state_dict(),
-                    "count": len(self.critics), "conservative": self.conservative, "entropy": self.entropy,
+                    "algorithm": self.algorithm, "algorithm_settings": {key:getattr(self,key) for key in ["expectile","temperature","samples"] if hasattr(self,key)}, "value": self.value.state_dict() if hasattr(self,"value") else None, "count": len(self.critics), "conservative": self.conservative, "entropy": self.entropy,
                     "constraint_penalty": self.constraint_penalty, "q95": q95, "interactions": interactions}, path)
 
     @classmethod
     def load(cls, path, device):
         saved = torch.load(path, map_location=device, weights_only=True)
-        learner = cls(saved["count"], device, saved["conservative"], saved["entropy"], saved["constraint_penalty"])
+        from .baselines import make_learner
+        learner = make_learner(saved.get("algorithm", "ugas"), device, saved["count"], saved["conservative"], saved["constraint_penalty"])
+        learner.entropy = saved["entropy"]
+        learner.conservative = saved["conservative"]
+        for key,value in saved.get("algorithm_settings",{}).items():
+            setattr(learner,key,value)
+        if saved.get("value") is not None:
+            learner.value.load_state_dict(saved["value"])
         learner.actor.load_state_dict(saved["actor"])
         learner.critics.load_state_dict(saved["critics"])
         learner.targets.load_state_dict(saved["targets"])
         return learner, saved
 
-    def action(self, state):
+    def action(self, state, deterministic=True):
         with torch.no_grad():
             state = torch.as_tensor(state, device=self.device)[None]
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
             begin = perf_counter()
-            mean = self.actor(state, deterministic=True)[0]
+            selected = self.actor(state, deterministic=deterministic)[0]
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
             inference_ms = 1000 * (perf_counter() - begin)
             begin = perf_counter()
-            q = torch.stack([critic(state, mean) for critic in self.critics])
+            q = torch.stack([critic(state, selected) for critic in self.critics])
             uncertainty = float(q.std(0, unbiased=True)) if len(self.critics) > 1 else 0.0
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
             uncertainty_ms = 1000 * (perf_counter() - begin)
-            return mean.cpu().numpy()[0], uncertainty, inference_ms, uncertainty_ms
+            return selected.cpu().numpy()[0], uncertainty, inference_ms, uncertainty_ms
 
 
 def draw_batch(arrays, count, rng):

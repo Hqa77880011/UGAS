@@ -64,7 +64,7 @@ CVaR integrates the worst 5% of the empirical distribution, with fractional prob
 
 ## Comparisons and ablations
 
-Use identical prepared data, seeds and interaction budgets. `online`/`evaluate` support `--exploration fixed|none`, `--no-projection`, `--policy rule|mpc`; `offline --conservative 0` and `--critics 1` retrain their respective removals. `offline --constraint-penalty 1` gives a declared soft-penalty control. `evaluate --ood` applies the documented compound shift; `--exploratory` evaluates the noisy interaction controller rather than actor-mean dispatch. The `online` checkpoint stores executed-action transitions and uses a 50:50 offline/online minibatch. Optimizers start fresh at each offline/online entry. The CQL-style learner is the repository's existing common learner. Separate SAC, IQL, Cal-QL and their original training recipes are not supplied, so the repository does not reproduce the complete paper baseline table.
+Use identical prepared data, seeds and interaction budgets. `online`/`evaluate` support `--exploration fixed|none`, `--no-projection`, `--policy rule|mpc`; `offline --conservative 0` and `--critics 1` retrain their respective removals. `offline --constraint-penalty 1` gives a declared soft-penalty control. `evaluate --ood` applies the documented compound shift; `--exploratory` evaluates the noisy interaction controller rather than actor-mean dispatch. The `online` checkpoint stores executed-action transitions and uses a 50:50 offline/online minibatch. Optimizers start fresh at each offline/online entry. The CQL-style learner is the repository's existing common learner. The independent SAC, IQL and Cal-QL controls are implemented below. Results still require the common measured input protocol and paired seeds.
 
 ## Functional verification
 
@@ -74,3 +74,24 @@ python -m pytest tests -q -p no:cacheprovider
 ```
 
 Verified on Python 3.13.5, torch 2.7.1+cu118 CPU and NumPy 2.1.3 with one thread and seed 42. A four-day synthetic CSV is split into four independent roles; a small dispatch replay supplies two offline updates, calibration, two online interactions and 24 held-out steps. Actor/critic finite gradients and updates and checkpoint output equality are checked. Analytic cases check a boundary projection, gate endpoints, and CVaR `(29 + 0.5*28)/1.5` for costs 0..29. These inputs test execution only and are separate from CityLearn/manuscript experiments.
+
+## Independent learner controls
+
+`ugas/baselines.py` implements distinct updates, sharing only the microgrid state/action interface and network widths: twin-critic SAC with no conservative term; IQL with expectile value regression (0.8), logged-action Q backup and advantage-weighted log-likelihood (inverse temperature 3, weight cap 100); Cal-QL with 10 uniform/current/next-policy samples, importance-corrected log-sum-exp conservative loss and complete-episode behavior return floors. The incomplete online suffix is assigned no MC floor, rather than a fabricated zero return. `Learner.load` restores the algorithm and IQL value state. Fixed entropy weight 0.1 and a single sampled Bellman target follow this microgrid implementation; automatic entropy and max-target-backup variants from the original Cal-QL release are not enabled.
+
+```bash
+ugas offline --data data/prepared --replay data/replay --algorithm sac --updates 0 --output runs/sac_init --seed 42
+ugas online --data data/prepared --replay data/replay --checkpoint runs/sac_init/model.pt --output runs/sac_online --offline-fraction 0 --exploration fixed --interactions 1440 --seed 42
+ugas offline --data data/prepared --replay data/replay --algorithm iql --output runs/iql --seed 42
+ugas offline --data data/prepared --replay data/replay --algorithm calql --output runs/calql --seed 42
+ugas calibrate --data data/prepared --replay data/replay --checkpoint runs/calql/model.pt --output runs/calql_calibrated --seed 42
+ugas online --data data/prepared --replay data/replay --checkpoint runs/calql_calibrated/model.pt --output runs/calql_online --exploration fixed --seed 42
+```
+
+Cal-QL with fixed noise and the same physical projection is the matched shielded control. Use identical prepared roles, action projection, budgets and exogenous seeds. Select hyperparameters using the online-development role; test data never fit MC floors or normalization.
+
+Mathematical references inspected for this implementation: [IQL authors' value/critic update](https://github.com/ikostrikov/implicit_q_learning/blob/master/critic.py), [IQL actor update](https://github.com/ikostrikov/implicit_q_learning/blob/master/actor.py), and [Cal-QL authors' conservative SAC source](https://github.com/nakamotoo/Cal-QL/blob/main/JaxCQL/conservative_sac.py). This is newly written PyTorch microgrid adaptation, not copied JAX experiment code.
+
+`python -m pytest tests/test_algorithms.py -q` verifies the expectile value, hand-computed calibrated conservative gap and its gradient direction, complete/unfinished MC boundaries, distinct actor updates and algorithm-preserving checkpoint round trips.
+
+During SAC online interaction, execution samples its learned squashed-Gaussian actor and does not add the UGAS external Gaussian gate noise; actor-mean dispatch is used for ordinary evaluation. IQL/Cal-QL retain the explicit microgrid fixed/band/no-noise comparison interface. Thus the SAC control changes both its mathematical update and its exploration law, rather than merely zeroing a conservative coefficient.

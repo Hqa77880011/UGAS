@@ -12,6 +12,7 @@ import torch
 
 from .environment import ACTION_SCALE, Microgrid, inequalities, mpc_action, project_action, rule_action
 from .learning import Learner, draw_batch
+from .baselines import make_learner, returns_to_go
 
 
 def empirical_cvar(costs, level=0.95):
@@ -87,16 +88,18 @@ def collect(args):
         packed.append(len(samples))
 
 
-def replay(path):
+def replay(path, with_returns=False):
     source = np.load(path, allow_pickle=False)
-    return tuple(source[k] for k in ["state", "action", "reward", "next_state", "done"])
+    arrays = tuple(source[k] for k in ["state", "action", "reward", "next_state", "done"])
+    return arrays + (returns_to_go(arrays[2], arrays[4]),) if with_returns else arrays
 
 
 def offline(args):
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
-    data = replay(Path(args.replay) / "offline_transitions.npz")
-    learner = Learner(args.critics, args.device, args.conservative, constraint_penalty=args.constraint_penalty)
+    algorithm = getattr(args, "algorithm", "ugas")
+    data = replay(Path(args.replay) / "offline_transitions.npz", algorithm == "calql")
+    learner = make_learner(algorithm, args.device, args.critics, args.conservative, args.constraint_penalty)
     history = []
     for step in range(args.updates):
         critic, actor = learner.update(draw_batch(data, args.batch_size, rng))
@@ -128,14 +131,16 @@ def execute(learner, saved, env, args, rng, exploratory):
             raw, mpc_success = mpc_action(env)
         uncertainty = 0.0
     else:
-        action, uncertainty, inference_ms, uncertainty_ms = learner.action(env.state())
+        action, uncertainty, inference_ms, uncertainty_ms = learner.action(env.state(), deterministic=not (learner.algorithm=="sac" and exploratory))
         q = min(1, uncertainty / (saved["q95"] + 1e-8))
         gate = uncertainty_gate(q, args.low, args.high)
         if args.exploration == "fixed":
             gate = 1
         if args.exploration == "none" or not exploratory:
             gate = 0
-        raw = action * ACTION_SCALE + gate * rng.normal(0, [5, 2])
+        if learner.algorithm=="sac":
+            gate=0  # SAC explores through its learned squashed-Gaussian policy.
+        raw = action * ACTION_SCALE if learner.algorithm=="sac" else action * ACTION_SCALE + gate * rng.normal(0, [5, 2])
     policy_seconds = perf_counter() - begin
     begin = perf_counter()
     physical, feasible = project_action(raw, env.soc, env.backlog, env.day[env.hour, 0], env.day[env.hour, 1], env.hour)
@@ -156,7 +161,7 @@ def online(args):
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     learner, saved = Learner.load(args.checkpoint, args.device)
-    offline_data = replay(Path(args.replay) / "offline_transitions.npz")
+    offline_data = replay(Path(args.replay) / "offline_transitions.npz", learner.algorithm == "calql")
     source = np.load(Path(args.data) / "online.npz", allow_pickle=False)
     if args.interactions > len(source["days"]) * 24:
         raise ValueError("Online budget exceeds its locked day partition")
@@ -172,8 +177,11 @@ def online(args):
         next_state, reward, done, info, action = execute(learner, saved, env, args, rng, True)
         samples.append((state, action / ACTION_SCALE, reward, next_state, done))
         online_data = tuple(np.array(v) for v in zip(*samples))
-        off_batch = draw_batch(offline_data, args.batch_size // 2, rng)
-        on_batch = draw_batch(online_data, args.batch_size - args.batch_size // 2, rng)
+        if learner.algorithm == "calql":
+            online_data = online_data + (returns_to_go(online_data[2], online_data[4]),)
+        offline_count = int(args.batch_size * getattr(args, "offline_fraction", .5))
+        off_batch = draw_batch(offline_data, offline_count, rng)
+        on_batch = draw_batch(online_data, args.batch_size - offline_count, rng)
         learner.update(tuple(np.concatenate([a, b]) for a, b in zip(off_batch, on_batch)))
         logs.append({"step": step + 1, **info})
         if step + 1 in {240, 720, 1440, args.interactions}:
@@ -295,6 +303,7 @@ def main():
         p.add_argument("--batch-size", type=int, default=256)
         if command == "offline":
             p.add_argument("--updates", type=int, default=500000)
+            p.add_argument("--algorithm", choices=["ugas", "sac", "iql", "calql"], default="ugas")
             p.add_argument("--critics", type=int, default=5)
             p.add_argument("--conservative", type=float, default=1)
             p.add_argument("--constraint-penalty", type=float, default=0)
@@ -309,6 +318,7 @@ def main():
             p.add_argument("--high", type=float, default=0.55)
             if command == "online":
                 p.add_argument("--interactions", type=int, default=1440)
+                p.add_argument("--offline-fraction", type=float, default=.5)
                 p.set_defaults(function=online)
             else:
                 p.add_argument("--ood", action="store_true")
