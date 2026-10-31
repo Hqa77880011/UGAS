@@ -14,6 +14,29 @@ from .environment import ACTION_SCALE, Microgrid, inequalities, mpc_action, proj
 from .learning import Learner, draw_batch
 
 
+def empirical_cvar(costs, level=0.95):
+    """Upper-tail empirical CVaR, including fractional mass at the tail boundary."""
+    values = np.asarray(costs, dtype=float)
+    if values.ndim != 1 or not len(values) or not np.isfinite(values).all():
+        raise ValueError("CVaR requires a nonempty finite vector of daily costs")
+    if not 0 <= level < 1:
+        raise ValueError("CVaR level must lie in [0, 1)")
+    descending = np.sort(values)[::-1]
+    mass = len(values) * (1 - level)
+    whole = int(np.floor(mass))
+    tail = descending[:whole].sum()
+    if whole < len(values):
+        tail += (mass - whole) * descending[whole]
+    return float(tail / mass)
+
+
+def uncertainty_gate(q, low=0.15, high=0.55):
+    """The registered discontinuous intermediate-disagreement band rule."""
+    if not 0 <= low < high <= 1:
+        raise ValueError("Gate thresholds must satisfy 0 <= low < high <= 1")
+    return (high - q) / (high - low) if low < q <= high else 0.0
+
+
 def prepare(args):
     with Path(args.csv).open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
@@ -107,7 +130,7 @@ def execute(learner, saved, env, args, rng, exploratory):
     else:
         action, uncertainty, inference_ms, uncertainty_ms = learner.action(env.state())
         q = min(1, uncertainty / (saved["q95"] + 1e-8))
-        gate = (args.high - q) / (args.high - args.low) if args.low < q <= args.high else 0
+        gate = uncertainty_gate(q, args.low, args.high)
         if args.exploration == "fixed":
             gate = 1
         if args.exploration == "none" or not exploratory:
@@ -180,12 +203,11 @@ def evaluate(args):
         days.append({"day": day_id, "cost_usd": total_cost, "system_violation_rate": float(np.mean([r["system_violation"] for r in rows]))})
         all_steps.extend({"day": day_id, "hour": h, **r} for h, r in enumerate(rows))
     costs = np.array([d["cost_usd"] for d in days])
-    threshold = np.quantile(costs, 0.95)
     violations = np.array([r["system_violation"] for r in all_steps])
     metrics = {"seed": args.seed, "interactions": saved["interactions"], "policy": args.policy,
                "exploration": args.exploration if args.exploratory else "none", "projection": not args.no_projection,
                "ood": args.ood, "mean_daily_cost_usd": float(costs.mean()),
-               "cvar95_usd": float(costs[costs >= threshold].mean()), "worst_day_cost_usd": float(costs.max()),
+               "cvar95_usd": empirical_cvar(costs), "worst_day_cost_usd": float(costs.max()),
                "raw_action_infeasibility": float(np.mean([r["raw_infeasible"] for r in all_steps])),
                "system_violation_rate": float(violations.mean()), "infeasible_set_rate": float(np.mean([r["infeasible_set"] for r in all_steps])),
                "policy_and_uncertainty_ms": float(np.mean([r["policy_and_uncertainty_ms"] for r in all_steps])),
@@ -294,3 +316,7 @@ def main():
                 p.set_defaults(function=evaluate)
     args = parser.parse_args()
     args.function(args)
+
+
+if __name__ == "__main__":
+    main()
