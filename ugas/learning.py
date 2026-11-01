@@ -88,14 +88,30 @@ class Learner:
 
     def save(self, path, q95=1, interactions=0):
         torch.save({"actor": self.actor.state_dict(), "critics": self.critics.state_dict(), "targets": self.targets.state_dict(),
-                    "algorithm": self.algorithm, "algorithm_settings": {key:getattr(self,key) for key in ["expectile","temperature","samples"] if hasattr(self,key)}, "value": self.value.state_dict() if hasattr(self,"value") else None, "count": len(self.critics), "conservative": self.conservative, "entropy": self.entropy,
+                    "algorithm": self.algorithm, "algorithm_settings": {key:getattr(self,key) for key in ["expectile","temperature","samples","automatic_entropy","max_target_backup","backup_entropy","target_entropy"] if hasattr(self,key)},
+                    "log_alpha": self.log_alpha.detach() if hasattr(self,"log_alpha") else None,
+                    "alpha_optimizer": self.alpha_optimizer.state_dict() if hasattr(self,"alpha_optimizer") else None,
+                    "value": self.value.state_dict() if hasattr(self,"value") else None, "count": len(self.critics), "conservative": self.conservative, "entropy": self.entropy,
                     "constraint_penalty": self.constraint_penalty, "q95": q95, "interactions": interactions}, path)
 
     @classmethod
     def load(cls, path, device):
         saved = torch.load(path, map_location=device, weights_only=True)
-        from .baselines import make_learner
-        learner = make_learner(saved.get("algorithm", "ugas"), device, saved["count"], saved["conservative"], saved["constraint_penalty"])
+        from .baselines import make_learner, CalQL
+        if saved.get('algorithm') == 'calql':
+            settings = dict(saved.get('algorithm_settings', {}))
+            # Pre-variant checkpoints retain their fixed-alpha, single soft backup.
+            settings.setdefault('automatic_entropy', False)
+            settings.setdefault('max_target_backup', False)
+            settings.setdefault('backup_entropy', True)
+            learner = CalQL(device, entropy=saved['entropy'], **settings)
+            if saved.get('log_alpha') is not None:
+                with torch.no_grad():
+                    learner.log_alpha.copy_(saved['log_alpha'])
+            if saved.get('alpha_optimizer') is not None:
+                learner.alpha_optimizer.load_state_dict(saved['alpha_optimizer'])
+        else:
+            learner = make_learner(saved.get("algorithm", "ugas"), device, saved["count"], saved["conservative"], saved["constraint_penalty"])
         learner.entropy = saved["entropy"]
         learner.conservative = saved["conservative"]
         for key,value in saved.get("algorithm_settings",{}).items():

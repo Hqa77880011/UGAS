@@ -96,3 +96,40 @@ def test_sac_stochastic_exploration_uses_actor_not_external_gate():
         learner, {"q95": 1.0}, Microgrid(day, forecasts), args, NoExternalNoise(), True
     )[3]
     assert not np.allclose(first["raw_action"], second["raw_action"])
+
+
+def test_calql_max_twin_minimum_and_selected_entropy():
+    first = torch.tensor([[10., 4.], [3., 0.]])
+    second = torch.tensor([[0., 5.], [2., 8.]])
+    logp = torch.tensor([[-1., -3.], [-4., -2.]])
+    torch.testing.assert_close(CalQL.backup_values(first, second, logp, .5, True, False), torch.tensor([4., 2.]))
+    torch.testing.assert_close(CalQL.backup_values(first, second, logp, .5, True, True), torch.tensor([5.5, 4.]))
+    torch.testing.assert_close(CalQL.backup_values(first, second, logp, .5, False, True), torch.tensor([.5, 4.]))
+
+
+def test_calql_entropy_checkpoint_and_legacy_identity(tmp_path):
+    torch.set_num_threads(1)
+    rng = np.random.default_rng(2)
+    batch = (rng.normal(size=(4, 106)).astype('float32'), np.zeros((4, 2), 'float32'),
+             -np.ones(4, 'float32'), rng.normal(size=(4, 106)).astype('float32'),
+             np.ones(4, 'float32'), -np.ones(4, 'float32'))
+    learner = CalQL(samples=3)
+    before = learner.log_alpha.detach().clone()
+    learner.update(batch)
+    assert not torch.equal(before, learner.log_alpha) and np.isfinite(learner.entropy)
+    checkpoint = tmp_path / 'calql.pt'
+    learner.save(checkpoint)
+    restored, saved = Learner.load(checkpoint, 'cpu')
+    assert restored.automatic_entropy and restored.max_target_backup and not restored.backup_entropy
+    torch.testing.assert_close(restored.log_alpha, learner.log_alpha)
+    assert restored.entropy == learner.entropy and restored.samples == 3
+    assert restored.alpha_optimizer.state_dict()['state'][0]['step'] == 1
+    fixed = CalQL(automatic_entropy=False, max_target_backup=False, backup_entropy=True, entropy=.1)
+    fixed.update(batch)
+    assert fixed.entropy == .1
+    saved['algorithm_settings'] = dict(samples=3)
+    saved['log_alpha'] = saved['alpha_optimizer'] = None
+    saved['entropy'] = .1
+    torch.save(saved, checkpoint)
+    legacy, _ = Learner.load(checkpoint, 'cpu')
+    assert not legacy.automatic_entropy and not legacy.max_target_backup and legacy.backup_entropy

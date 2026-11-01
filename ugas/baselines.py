@@ -94,9 +94,30 @@ class CalQL(Learner):
 
     algorithm = "calql"
 
-    def __init__(self, device="cpu", samples=10):
+    def __init__(self, device="cpu", samples=10, automatic_entropy=True,
+                 max_target_backup=True, backup_entropy=False, target_entropy=-2., entropy=1.):
         super().__init__(2, device, conservative=1)
         self.samples = samples
+        self.automatic_entropy = automatic_entropy
+        self.max_target_backup = max_target_backup
+        self.backup_entropy = backup_entropy
+        self.target_entropy = target_entropy
+        self.entropy = entropy
+        self.log_alpha = torch.tensor(math.log(entropy), device=device, requires_grad=True)
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=1e-4)
+        # The public Cal-QL default uses a slower policy/entropy learning rate.
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
+
+    @staticmethod
+    def backup_values(first, second, logp, entropy, maximum, backup_entropy):
+        """Maximize the twin minimum, then optionally subtract selected log density."""
+        values = torch.minimum(first, second)
+        index = values.argmax(1, keepdim=True) if maximum else torch.zeros(
+            (len(values), 1), dtype=torch.long, device=values.device)
+        selected = values.gather(1, index)[:, 0]
+        if backup_entropy:
+            selected = selected - entropy * logp.gather(1, index)[:, 0]
+        return selected
 
     @staticmethod
     def conservative_gap(
@@ -128,11 +149,13 @@ class CalQL(Learner):
         repeated = s[:, None].expand(-1, self.samples, -1).reshape(-1, 106)
         next_repeated = ns[:, None].expand(-1, self.samples, -1).reshape(-1, 106)
         with torch.no_grad():
-            na, nlp = self.actor(ns)
-            target = r + 0.99 * (1 - done) * (
-                torch.stack([q(ns, na) for q in self.targets]).min(0).values
-                - self.entropy * nlp
-            )
+            count = self.samples if self.max_target_backup else 1
+            backup_state = ns[:, None].expand(-1, count, -1).reshape(-1, 106)
+            na, nlp = self.actor(backup_state)
+            next_values = [q(backup_state, na).reshape(n, count) for q in self.targets]
+            target = r + .99 * (1 - done) * self.backup_values(
+                *next_values, nlp.reshape(n, count), self.entropy,
+                self.max_target_backup, self.backup_entropy)
             pa, plp = self.actor(repeated)
             npa, nplp = self.actor(next_repeated)
             random = torch.empty(n * self.samples, 2, device=self.device).uniform_(
@@ -166,6 +189,12 @@ class CalQL(Learner):
         self.actor_optimizer.zero_grad()
         aloss.backward()
         self.actor_optimizer.step()
+        if self.automatic_entropy:
+            alpha_loss = -(self.log_alpha * (lp.detach() + self.target_entropy)).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+            self.entropy = float(self.log_alpha.detach().exp())
         for p in self.critics.parameters():
             p.requires_grad_(True)
         with torch.no_grad():
@@ -177,7 +206,8 @@ class CalQL(Learner):
 
 
 def make_learner(
-    algorithm, device="cpu", critics=5, conservative=1.0, constraint_penalty=0
+    algorithm, device="cpu", critics=5, conservative=1.0, constraint_penalty=0,
+    calql_settings=None,
 ):
     """Construct the selected mathematical update, retaining the UGAS learner."""
     if algorithm == "ugas":
@@ -186,7 +216,8 @@ def make_learner(
         )
     if constraint_penalty:
         raise ValueError("Soft constraint penalty is a UGAS/common-learner control")
-    learner = {"sac": SAC, "iql": IQL, "calql": CalQL}[algorithm](device)
+    learner = (CalQL(device, **(calql_settings or {})) if algorithm == 'calql'
+               else {"sac": SAC, "iql": IQL}[algorithm](device))
     if algorithm == "calql":
         learner.conservative = conservative
     return learner

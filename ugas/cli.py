@@ -99,7 +99,11 @@ def offline(args):
     rng = np.random.default_rng(args.seed)
     algorithm = getattr(args, "algorithm", "ugas")
     data = replay(Path(args.replay) / "offline_transitions.npz", algorithm == "calql")
-    learner = make_learner(algorithm, args.device, args.critics, args.conservative, args.constraint_penalty)
+    settings = dict(automatic_entropy=not getattr(args, 'calql_fixed_entropy', False),
+                    max_target_backup=not getattr(args, 'calql_single_target', False),
+                    backup_entropy=getattr(args, 'calql_backup_entropy', False)) if algorithm == 'calql' else None
+    learner = make_learner(algorithm, args.device, args.critics, args.conservative,
+                           args.constraint_penalty, calql_settings=settings)
     history = []
     for step in range(args.updates):
         critic, actor = learner.update(draw_batch(data, args.batch_size, rng))
@@ -307,6 +311,9 @@ def main():
             p.add_argument("--critics", type=int, default=5)
             p.add_argument("--conservative", type=float, default=1)
             p.add_argument("--constraint-penalty", type=float, default=0)
+            p.add_argument('--calql-fixed-entropy', action='store_true')
+            p.add_argument('--calql-single-target', action='store_true')
+            p.add_argument('--calql-backup-entropy', action='store_true')
             p.set_defaults(function=offline)
         elif command == "calibrate":
             p.set_defaults(function=calibrate)

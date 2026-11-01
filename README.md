@@ -77,7 +77,7 @@ Verified on Python 3.13.5, torch 2.7.1+cu118 CPU and NumPy 2.1.3 with one thread
 
 ## Independent learner controls
 
-`ugas/baselines.py` implements distinct updates, sharing only the microgrid state/action interface and network widths: twin-critic SAC with no conservative term; IQL with expectile value regression (0.8), logged-action Q backup and advantage-weighted log-likelihood (inverse temperature 3, weight cap 100); Cal-QL with 10 uniform/current/next-policy samples, importance-corrected log-sum-exp conservative loss and complete-episode behavior return floors. The incomplete online suffix is assigned no MC floor, rather than a fabricated zero return. `Learner.load` restores the algorithm and IQL value state. Fixed entropy weight 0.1 and a single sampled Bellman target follow this microgrid implementation; automatic entropy and max-target-backup variants from the original Cal-QL release are not enabled.
+`ugas/baselines.py` implements distinct updates, sharing only the microgrid state/action interface and network widths: twin-critic SAC with no conservative term; IQL with expectile value regression (0.8), logged-action Q backup and advantage-weighted log-likelihood (inverse temperature 3, weight cap 100); Cal-QL with 10 uniform/current/next-policy samples, importance-corrected log-sum-exp conservative loss and complete-episode behavior return floors. The incomplete online suffix is assigned no MC floor, rather than a fabricated zero return. `Learner.load` restores the algorithm and IQL value state. Cal-QL now defaults to automatic entropy tuning and a ten-proposal max-target backup, with the explicit settings below. SAC retains its own fixed entropy coefficient0.1.
 
 ```bash
 ugas offline --data data/prepared --replay data/replay --algorithm sac --updates 0 --output runs/sac_init --seed 42
@@ -95,3 +95,17 @@ Mathematical references inspected for this implementation: [IQL authors' value/c
 `python -m pytest tests/test_algorithms.py -q` verifies the expectile value, hand-computed calibrated conservative gap and its gradient direction, complete/unfinished MC boundaries, distinct actor updates and algorithm-preserving checkpoint round trips.
 
 During SAC online interaction, execution samples its learned squashed-Gaussian actor and does not add the UGAS external Gaussian gate noise; actor-mean dispatch is used for ordinary evaluation. IQL/Cal-QL retain the explicit microgrid fixed/band/no-noise comparison interface. Thus the SAC control changes both its mathematical update and its exploration law, rather than merely zeroing a conservative coefficient.
+
+## Cal-QL entropy and target-backup settings
+
+The primary [Cal-QL implementation](https://github.com/nakamotoo/Cal-QL/blob/ac6eafec22e8d60836573e1f488c7f626ce8a77e/JaxCQL/conservative_sac.py) and [launcher](https://github.com/nakamotoo/Cal-QL/blob/ac6eafec22e8d60836573e1f488c7f626ce8a77e/JaxCQL/conservative_sac_main.py) were checked at the pinned revision. The adaptation now implements its automatic log-alpha objective, initial alpha1, two-action target entropy-2, policy/alpha Adam learning rate1e-4, ten-action maximum backup and default `backup_entropy=False`. It maximizes the twin-critic minimum over proposals, then subtracts the selected proposal's entropy only when enabled. Taking separate critic maxima or maximizing after entropy subtraction gives a different target.
+
+```bash
+# Explicit bounded software check, not the full offline training budget.
+ugas offline --replay data/replay --algorithm calql --updates 2 --batch-size 4 --output runs/calql-check
+# Configurable comparison: fixed alpha1 / single proposal / soft target.
+ugas offline --replay data/replay --algorithm calql --updates 2 --batch-size 4 --calql-fixed-entropy --calql-single-target --calql-backup-entropy --output runs/calql-variant
+python -m pytest tests/test_algorithms.py tests/test_implementation.py -q
+```
+
+All flags, target entropy, learned log-alpha and alpha optimizer state survive checkpoints. Old checkpoints without those settings retain their earlier fixed-alpha/single-soft-target identity on loading. The common microgrid critic widths, reward scaling and configurable conservative coefficient (default1) remain explicit adaptations; these changes do not imply reconstruction of historical Cal-QL tuning or published microgrid scores. Seven targeted tests passed: hand max-of-twin-minimum/selected-log-density values, actual entropy updates/fixed-alpha behavior, optimizer/checkpoint identity, legacy settings, distinct learner gradients, MC boundaries and the existing bounded dispatch pipeline. Original offline/online logs, full budgets and final performance remain external requirements.
