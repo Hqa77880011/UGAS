@@ -1,6 +1,6 @@
 # UGAS
 
-Implementation of **Safe Offline-to-Online Reinforcement Learning with Uncertainty-Gated Action Shielding** for hourly microgrid scheduling. Conservative ensemble value learning supplies a calibrated uncertainty band; a physical action projection enforces the current battery, backlog, recoverability and grid constraints.
+**Safe Offline-to-Online Reinforcement Learning with Uncertainty-Gated Action Shielding** for hourly microgrid scheduling. Conservative ensemble value learning supplies a calibrated uncertainty band; a physical action projection enforces the current battery, backlog, recoverability and grid constraints.
 
 ## Installation
 
@@ -49,7 +49,7 @@ ugas evaluate --data data/prepared --checkpoint runs/online/step_1440.pt --outpu
 
 Prepared role/replay archives stay under `data/`. Offline/calibration folders contain models and losses; online saves interaction checkpoints including `step_1440.pt`. Evaluation writes `metrics.json`, `days.json`, `steps.json` and `daily_cost.png`.
 
-## Paper-to-code map
+## Modules and metrics
 
 | Component / metric | Entry | Command / setting |
 |---|---|---|
@@ -64,16 +64,14 @@ CVaR integrates the worst 5% of the empirical distribution, with fractional prob
 
 ## Comparisons and ablations
 
-Use identical prepared data, seeds and interaction budgets. `online`/`evaluate` support `--exploration fixed|none`, `--no-projection`, `--policy rule|mpc`; `offline --conservative 0` and `--critics 1` retrain their respective removals. `offline --constraint-penalty 1` gives a declared soft-penalty control. `evaluate --ood` applies the documented compound shift; `--exploratory` evaluates the noisy interaction controller rather than actor-mean dispatch. The `online` checkpoint stores executed-action transitions and uses a 50:50 offline/online minibatch. Optimizers start fresh at each offline/online entry. The CQL-style learner is the repository's existing common learner. The independent SAC, IQL and Cal-QL controls are implemented below. Results still require the common measured input protocol and paired seeds.
+Use identical prepared data, seeds and interaction budgets. `online`/`evaluate` support `--exploration fixed|none`, `--no-projection` and `--policy rule|mpc`; retrain with `offline --conservative 0`, `--critics 1` or `--constraint-penalty 1` for those controls. `evaluate --ood` applies a compound shift; `--exploratory` evaluates the noisy controller. Online learning uses a 50:50 offline/online minibatch and saves executed-action transitions. Optimizers start fresh at each offline/online entry.
 
-## Functional verification
+## Checks
 
 ```bash
 python -m pip install pytest
 python -m pytest tests -q -p no:cacheprovider
 ```
-
-Verified on Python 3.13.5, torch 2.7.1+cu118 CPU and NumPy 2.1.3 with one thread and seed 42. A four-day synthetic CSV is split into four independent roles; a small dispatch replay supplies two offline updates, calibration, two online interactions and 24 held-out steps. Actor/critic finite gradients and updates and checkpoint output equality are checked. Analytic cases check a boundary projection, gate endpoints, and CVaR `(29 + 0.5*28)/1.5` for costs 0..29. These inputs test execution only and are separate from CityLearn/manuscript experiments.
 
 ## Independent learner controls
 
@@ -90,22 +88,20 @@ ugas online --data data/prepared --replay data/replay --checkpoint runs/calql_ca
 
 Cal-QL with fixed noise and the same physical projection is the matched shielded control. Use identical prepared roles, action projection, budgets and exogenous seeds. Select hyperparameters using the online-development role; test data never fit MC floors or normalization.
 
-Mathematical references inspected for this implementation: [IQL authors' value/critic update](https://github.com/ikostrikov/implicit_q_learning/blob/master/critic.py), [IQL actor update](https://github.com/ikostrikov/implicit_q_learning/blob/master/actor.py), and [Cal-QL authors' conservative SAC source](https://github.com/nakamotoo/Cal-QL/blob/main/JaxCQL/conservative_sac.py). This is newly written PyTorch microgrid adaptation, not copied JAX experiment code.
+Algorithm sources: [IQL value/critic update](https://github.com/ikostrikov/implicit_q_learning/blob/master/critic.py), [IQL actor update](https://github.com/ikostrikov/implicit_q_learning/blob/master/actor.py), [Cal-QL conservative SAC](https://github.com/nakamotoo/Cal-QL/blob/main/JaxCQL/conservative_sac.py).
 
-`python -m pytest tests/test_algorithms.py -q` verifies the expectile value, hand-computed calibrated conservative gap and its gradient direction, complete/unfinished MC boundaries, distinct actor updates and algorithm-preserving checkpoint round trips.
-
-During SAC online interaction, execution samples its learned squashed-Gaussian actor and does not add the UGAS external Gaussian gate noise; actor-mean dispatch is used for ordinary evaluation. IQL/Cal-QL retain the explicit microgrid fixed/band/no-noise comparison interface. Thus the SAC control changes both its mathematical update and its exploration law, rather than merely zeroing a conservative coefficient.
+SAC samples its squashed-Gaussian actor during online interaction; ordinary evaluation uses its mean. IQL/Cal-QL support the configured microgrid fixed/band/no-noise interface.
 
 ## Cal-QL entropy and target-backup settings
 
-The primary [Cal-QL implementation](https://github.com/nakamotoo/Cal-QL/blob/ac6eafec22e8d60836573e1f488c7f626ce8a77e/JaxCQL/conservative_sac.py) and [launcher](https://github.com/nakamotoo/Cal-QL/blob/ac6eafec22e8d60836573e1f488c7f626ce8a77e/JaxCQL/conservative_sac_main.py) were checked at the pinned revision. The adaptation now implements its automatic log-alpha objective, initial alpha1, two-action target entropy-2, policy/alpha Adam learning rate1e-4, ten-action maximum backup and default `backup_entropy=False`. It maximizes the twin-critic minimum over proposals, then subtracts the selected proposal's entropy only when enabled. Taking separate critic maxima or maximizing after entropy subtraction gives a different target.
+Cal-QL follows the pinned [conservative SAC implementation](https://github.com/nakamotoo/Cal-QL/blob/ac6eafec22e8d60836573e1f488c7f626ce8a77e/JaxCQL/conservative_sac.py) and [launcher](https://github.com/nakamotoo/Cal-QL/blob/ac6eafec22e8d60836573e1f488c7f626ce8a77e/JaxCQL/conservative_sac_main.py): automatic log-alpha tuning, initial alpha 1, target entropy -2, policy/alpha Adam learning rate 1e-4, ten-action maximum backup and `backup_entropy=False`. The target maximizes the twin-critic minimum, then optionally subtracts the selected proposal entropy.
 
 ```bash
-# Explicit bounded software check, not the full offline training budget.
+# Two-update check.
 ugas offline --replay data/replay --algorithm calql --updates 2 --batch-size 4 --output runs/calql-check
 # Configurable comparison: fixed alpha1 / single proposal / soft target.
 ugas offline --replay data/replay --algorithm calql --updates 2 --batch-size 4 --calql-fixed-entropy --calql-single-target --calql-backup-entropy --output runs/calql-variant
 python -m pytest tests/test_algorithms.py tests/test_implementation.py -q
 ```
 
-All flags, target entropy, learned log-alpha and alpha optimizer state survive checkpoints. Old checkpoints without those settings retain their earlier fixed-alpha/single-soft-target identity on loading. The common microgrid critic widths, reward scaling and configurable conservative coefficient (default1) remain explicit adaptations; these changes do not imply reconstruction of historical Cal-QL tuning or published microgrid scores. Seven targeted tests passed: hand max-of-twin-minimum/selected-log-density values, actual entropy updates/fixed-alpha behavior, optimizer/checkpoint identity, legacy settings, distinct learner gradients, MC boundaries and the existing bounded dispatch pipeline. Original offline/online logs, full budgets and final performance remain external requirements.
+Checkpoints store algorithm flags, target entropy, log-alpha and alpha optimizer state. Critic widths, reward scaling and conservative coefficient (default 1) are configurable.
